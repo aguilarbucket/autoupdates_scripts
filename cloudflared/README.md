@@ -6,6 +6,8 @@ Actualizador en **POSIX sh** para el conector `cloudflared` desplegado con **Doc
 
 > **Alcance:** este proyecto gestiona **exclusivamente el conector `cloudflared`**. No actualiza ni configura servidores web, proxies inversos, aplicaciones, reglas de Cloudflare o el origen del túnel.
 
+**¿Primer despliegue?** Consulta [Crear y levantar un túnel por primera vez](#crear-y-levantar-un-túnel-por-primera-vez). **¿El túnel ya funciona?** Puedes pasar a [Instalación del actualizador](#instalación-del-actualizador-solo-para-túneles-existentes). El script `update-cloudflared.sh` **no crea ni inicializa túneles**.
+
 > **Privacidad de ejemplos:** todos los dominios `example.com`, nombres de host, rutas de despliegue y direcciones del segmento `10.0.0.0/8` de esta documentación son **ficticios e ilustrativos**. No representan infraestructura real.
 
 ## Arquitectura genérica
@@ -62,6 +64,104 @@ El comando de recreación usa `docker compose up -d --no-deps --pull never`, por
 
 **Cifrado:** Cloudflare cifra la conexión con el conector. El protocolo entre `cloudflared` y el origen (por ejemplo, HTTP o HTTPS) depende de la configuración del túnel; no se puede inferir de la conexión pública HTTPS ni del modo SSL/TLS del dashboard.
 
+## Crear y levantar un túnel por primera vez
+
+Esta guía es para el **arranque inicial del conector**, no para ejecutar `update-cloudflared.sh`. Utiliza un **túnel administrado desde el dashboard de Cloudflare** (*remotely managed*), recomendado por Cloudflare para Docker. No modifica la lógica del script ni exige Caddy, Nginx, Apache u otro proxy.
+
+### 1. Crear el túnel en Cloudflare
+
+1. Necesitas una cuenta de Cloudflare, un dominio gestionado allí si publicarás un hostname y un servidor Linux con Docker Engine y Docker Compose.
+2. En [Cloudflare Dashboard](https://dash.cloudflare.com/) entra en **Networking → Tunnels → Create Tunnel**.
+3. Asigna un nombre **ficticio para el ejemplo**, como `example-tunnel`, y crea el túnel.
+4. En las instrucciones de instalación, selecciona **Docker** y conserva **solo el token** que aparece en el comando ofrecido por Cloudflare. **No pegues el comando completo ni el token en el repositorio, en issues, en logs o en capturas públicas**.
+
+**Documentación oficial:** [Crear un túnel desde el dashboard](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/) · [Tokens de Cloudflare Tunnel](https://developers.cloudflare.com/tunnel/reference/tunnel-tokens/).
+
+### 2. Guardar el token fuera del Compose
+
+En el **host Linux donde ejecutarás Docker Compose**, crea un directorio privado y un archivo para el token:
+
+```sh
+sudo install -d -m 700 /opt/cloudflared
+sudo install -m 600 /dev/null /opt/cloudflared/tunnel_token
+sudoedit /opt/cloudflared/tunnel_token
+```
+
+En el editor, pega **únicamente el token real obtenido en tu cuenta Cloudflare**, guarda y cierra. No introduzcas el token como argumento de comandos ni lo almacenes en un `.env` que pueda terminar en Git. Trata `tunnel_token` como un **secreto** y exclúyelo de copias públicas.
+
+### 3. Crear el Compose del conector (ejemplo genérico)
+
+Crea `/opt/cloudflared/compose.yaml` con este contenido:
+
+```yaml
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    user: "0:0"
+    command: [tunnel, --no-autoupdate, run, --token-file, /run/secrets/tunnel_token]
+    volumes:
+      - ./tunnel_token:/run/secrets/tunnel_token:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+```
+
+`user: "0:0"` permite leer el archivo del token, limitado a `root:root` y modo `600` en este ejemplo. `cap_drop` y `no-new-privileges` reducen privilegios, **pero no convierten al proceso en no-root**. Adapta los permisos y el modelo de ejecución a tus políticas de seguridad.
+
+El conector inicia una **conexión saliente** con Cloudflare: para este flujo no necesitas publicar puertos de `cloudflared` en Docker ni abrir un puerto de entrada del túnel hacia Internet. Comprueba que la red permita las conexiones salientes necesarias (incluido el puerto **7844**, según el transporte).
+
+**Importante:** este Compose es un ejemplo nuevo, no una reproducción de ninguna infraestructura. No define ni modifica el origen o proxy inverso. El parámetro `--token-file` está documentado por Cloudflare en [Run parameters](https://developers.cloudflare.com/tunnel/reference/run-parameters/) y requiere `cloudflared` **2025.4.0 o superior**.
+
+### 4. Arrancar `cloudflared` por primera vez
+
+```sh
+# Verifica la sintaxis del Compose sin mostrar el token.
+sudo docker compose -f /opt/cloudflared/compose.yaml config --quiet
+
+# Primer arranque (NO usar update-cloudflared.sh en este paso).
+sudo docker compose -f /opt/cloudflared/compose.yaml up -d cloudflared
+
+# Comprobar contenedor y logs.
+sudo docker compose -f /opt/cloudflared/compose.yaml ps
+sudo docker compose -f /opt/cloudflared/compose.yaml logs --tail=50 cloudflared
+```
+
+En **Networking → Tunnels**, comprueba que el conector aparezca como **Healthy**. Si falla, revisa el token, conectividad saliente y errores del contenedor. **No uses el actualizador para recuperar el primer arranque**, porque necesita inspeccionar un contenedor existente y comprobar una URL pública previamente operativa.
+
+### 5. Configurar a qué servicio debe llegar el túnel
+
+En el dashboard, abre el túnel → **Routes → Add route → Published application** y configura, por ejemplo:
+
+| Campo | Valor exclusivamente ilustrativo |
+| --- | --- |
+| Public hostname | `tunnel.example.com` |
+| Service URL | `http://10.10.10.20:8080` |
+
+La dirección `10.10.10.20` es **un ejemplo RFC 1918**, no una dirección de producción. Puede apuntar directamente a una aplicación o a cualquier proxy inverso compatible. `cloudflared` debe poder alcanzar ese origen desde su propio entorno de red. Si la aplicación corre en el host Docker, recuerda que `localhost` dentro del contenedor **no es el host**.
+
+El hostname publicado será accesible desde Internet según las políticas que configures. **Protege las aplicaciones privadas o administrativas con Cloudflare Access u otros controles de acceso adecuados.** Crear esta ruta es una acción de Cloudflare independiente de nuestro script.
+
+**Documentación oficial:** [Publicar una aplicación mediante Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/).
+
+### 6. Validar antes de activar las actualizaciones
+
+```sh
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+  https://tunnel.example.com/health
+
+sudo docker inspect cloudflared --format '{{.Image}} {{.State.Status}}'
+```
+
+La ruta `/health` es **ilustrativa**: debes disponer de un endpoint real que devuelva **HTTP 200**, sin autenticación, redirección ni parámetros de consulta existentes, y tolere el parámetro adicional `update_probe` del script. Si no existe ese endpoint, **no actives todavía el actualizador**; el chequeo fallará aunque el túnel esté conectado.
+
+**Solo después de tener el contenedor funcionando, el túnel conectado y la URL de salud respondiendo HTTP 200 corresponde instalar y programar `update-cloudflared.sh`.** Al hacerlo, usa `COMPOSE`, `SERVICE`, `CONTAINER`, `IMAGE` y `URL` acordes con el servicio realmente desplegado.
+
+---
+
 ## Funcionamiento
 
 1. Inspecciona la imagen del contenedor `cloudflared` actualmente desplegado.
@@ -106,7 +206,9 @@ Configura las variables de entorno para **tu propio despliegue**. Los valores si
 
 El script construye cada comprobación agregando `?update_probe=...` a `URL`; por ello, usa una URL **sin parámetros de consulta previos**. La ruta debe admitirlos y devolver HTTP 200 en condiciones normales.
 
-## Instalación
+## Instalación del actualizador (solo para túneles existentes)
+
+**Requisito previo:** completa el [primer despliegue](#crear-y-levantar-un-túnel-por-primera-vez) si todavía no tienes un conector operativo. Este apartado instala **solo el actualizador**; no crea el túnel ni levanta el contenedor por primera vez.
 
 Descarga el script de este mismo directorio y revísalo antes de instalarlo:
 
